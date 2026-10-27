@@ -144,8 +144,8 @@ OS keyring and `GROQ_API_KEY` in the backend `.env`.
 The API protects status, query, indexing, Jira connect/sync/disconnect, and
 other `/api` endpoints with the bearer session whenever a backend password is
 configured. It also limits login, query, mutation, and read request rates,
-rejects request bodies larger than 1 MB when a content length is supplied, and
-validates API payload fields. `/api/health` is intentionally public and returns
+rejects request bodies larger than 1 MB (including streamed bodies without a
+content length), and validates API payload fields. `/api/health` is intentionally public and returns
 only service availability and whether authentication is enabled. CORS allows
 only the local development origins plus exact origins in
 `FRONTEND_ORIGINS`; credentialed CORS and wildcard origins are disabled.
@@ -242,9 +242,9 @@ gate, not per-user authorization. Anyone who learns the password can query the
 local PDF/Jira/Confluence index and use the configured Groq quota. Rate limits
 are in-memory best-effort protection, not a distributed abuse-prevention
 system. Do not publish the password, enable untrusted preview origins, or use
-this as a multi-user/production service. Cloudflare Tunnel avoids direct router
-port forwarding, but the backend is still internet-reachable through its
-authenticated tunnel hostname.
+this as a multi-user/production service. Ngrok avoids direct router port
+forwarding, but the backend is still internet-reachable through its public
+HTTPS forwarding URL. Rotate the ngrok auth token if it is ever exposed.
 
 ## Current limitations
 
@@ -255,8 +255,9 @@ authenticated tunnel hostname.
   ranking, not answer correctness. Answer quality is measured only when a
   supplied answer file is provided.
 - No local reranker or LLM-judge evaluation is configured.
-- The application has no login, conversation history, feedback persistence,
-  or streaming response support.
+- The application has a single shared backend-password login, but no
+  multi-user identity, conversation history, feedback persistence, or streaming
+  response support.
 - PDF IDs now carry a content/configuration version and failed upserts preserve
   the previous records. ChromaDB replacement is not fully atomic, and Jira
   embedding-space migration, background indexing jobs, and detailed sync

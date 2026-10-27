@@ -27,11 +27,12 @@ authorization.
 
 CORS allows only local development origins plus explicitly configured,
 validated origins; wildcard and credentialed CORS are disabled. CORS is not
-authentication or authorization. Cloudflare Tunnel provides HTTPS forwarding
+authentication or authorization. The ngrok agent provides HTTPS forwarding
 without router port forwarding, but makes the backend reachable from the
 internet and requires the backend password. Never create a public tunnel with
 an empty `RAG_ACCESS_PASSWORD`, bind FastAPI to a shared interface, or rely on
-CORS to protect indexed content.
+CORS to protect indexed content. Keep the ngrok auth token private and rotate
+it immediately if it is exposed.
 
 ## Data sent to external services
 

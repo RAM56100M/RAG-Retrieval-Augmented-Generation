@@ -460,7 +460,7 @@ function App() {
           <h1>Backend unavailable</h1>
           <p>
             The RAG backend could not be reached. Check that your laptop is
-            awake, FastAPI is running, and the Cloudflare Tunnel is connected.
+            awake, FastAPI is running, and the ngrok tunnel is connected.
           </p>
           {error && <div className="error-banner" role="alert">{error}</div>}
           <button className="outline-button access-submit" onClick={() => void retryBackend()} disabled={checkingBackend}>

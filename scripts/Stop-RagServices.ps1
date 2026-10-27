@@ -9,7 +9,6 @@ if (-not (Test-Path $stateFile)) {
 
 $state = Get-Content $stateFile -Raw | ConvertFrom-Json
 $targets = @(
-    @{ Id = $state.tunnelPid; Pattern = 'cloudflared(\.exe)?.*tunnel run' },
     @{ Id = $state.backendPid; Pattern = 'python(\.exe)?.*-m uvicorn backend\.main:app' }
 )
 foreach ($target in $targets) {
