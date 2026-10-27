@@ -63,6 +63,9 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
     ...init,
     headers: { "Content-Type": "application/json", ...init?.headers },
   });
+  if (!response.headers.get("content-type")?.includes("application/json")) {
+    throw new Error("The RAG API returned an unexpected response. Check that the backend is running.");
+  }
   if (!response.ok) {
     const body = await response.json().catch(() => null);
     throw new Error(
@@ -265,7 +268,11 @@ function App() {
               </div>
             </form>
 
-            {error && <div className="error-banner" role="alert">{error}</div>}
+            {(error || (status?.stage === "error" ? status.error : null)) && (
+              <div className="error-banner" role="alert">
+                {error || status?.error}
+              </div>
+            )}
 
             {!result && !asking && (
               <div className="suggestion-area">

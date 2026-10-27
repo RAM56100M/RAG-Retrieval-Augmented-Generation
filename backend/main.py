@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Any
 
 import chromadb
-import fitz
+import pymupdf
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -98,7 +98,7 @@ def ingest_document() -> None:
         try:
             set_status("reading", "Reading and extracting PDF text", error=None)
             source = find_pdf()
-            with fitz.open(source) as document:
+            with pymupdf.open(source) as document:
                 page_count = len(document)
                 pages = [
                     (page_number, page.get_text("text"))
