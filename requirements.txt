@@ -7,3 +7,4 @@ transformers>=4.45,<5
 pymupdf>=1.25,<2
 groq>=0.18,<1
 python-dotenv>=1,<2
+keyring>=25,<26
