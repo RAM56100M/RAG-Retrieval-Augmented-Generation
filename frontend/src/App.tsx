@@ -182,7 +182,7 @@ function App() {
           <div className="steps-row">
             {stages.map((stage, index) => {
               const Icon = stage.icon;
-              const complete = isReady && index < 4 || (asking && index < 4) || (!asking && currentStage > index && currentStage >= 0);
+              const complete = (isReady && index < 4) || (asking && index < 4) || (!!result && index >= 4) || (!asking && currentStage > index && currentStage >= 0);
               const active = activeStage === index;
               return (
                 <div className={`pipeline-step ${complete ? "step-done" : ""} ${active ? "step-active" : ""}`} key={stage.id}>
