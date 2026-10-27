@@ -104,10 +104,147 @@ ChromaDB. Source filters let you search PDF, Jira, or Confluence content.
 Vectors are stored locally; the question and its retrieved excerpts are sent
 to Groq to generate an answer.
 
-The local frontend and API are not protected by application login. Keep the
-frontend bound to loopback as configured; do not expose it through a public
-tunnel without adding authentication and request limits, since visitors could
-query indexed Jira/PDF content and use the configured Groq quota.
+## Publish the frontend to Vercel; keep the backend local
+
+The React/Vite frontend can be deployed as a static Vercel project. FastAPI,
+the PDF files, the Nomic model cache, Jira credentials, and ChromaDB remain on
+your Windows laptop. An ngrok tunnel provides HTTPS connectivity from the
+public website to FastAPI without router port forwarding. The laptop must stay
+powered on, awake, and connected to the internet for queries to work.
+
+### Configure the local backend
+
+In the project-root `.env` (never commit this file), set:
+
+```dotenv
+GROQ_API_KEY=your-server-side-Groq-key
+FRONTEND_ORIGINS=https://your-project.vercel.app
+RAG_ACCESS_PASSWORD=replace-with-a-random-password-at-least-16-characters
+RAG_ACCESS_TOKEN_TTL_SECONDS=3600
+```
+
+Set `FRONTEND_ORIGINS` to the exact HTTPS origin shown by Vercel, without a
+path or trailing slash. If using a custom frontend domain, list that exact
+origin instead. Multiple explicitly allowed origins may be comma-separated.
+The backend validates the origins and refuses a remote origin unless a
+password of at least 16 characters is configured. Generate a password locally
+with:
+
+```powershell
+.\.venv\Scripts\python.exe -c "import secrets; print(secrets.token_urlsafe(32))"
+```
+
+Paste the generated value into the laptop's `.env`; do not put it in Vercel or
+in any `VITE_*` setting. The frontend prompts for this password at runtime.
+FastAPI issues a short-lived bearer session, kept only in the open browser tab.
+It is not saved in local storage; refresh/reopen requires signing in again.
+Signing out revokes the session. Keep the existing Atlassian API token in the
+OS keyring and `GROQ_API_KEY` in the backend `.env`.
+
+The API protects status, query, indexing, Jira connect/sync/disconnect, and
+other `/api` endpoints with the bearer session whenever a backend password is
+configured. It also limits login, query, mutation, and read request rates,
+rejects request bodies larger than 1 MB when a content length is supplied, and
+validates API payload fields. `/api/health` is intentionally public and returns
+only service availability and whether authentication is enabled. CORS allows
+only the local development origins plus exact origins in
+`FRONTEND_ORIGINS`; credentialed CORS and wildcard origins are disabled.
+CORS is a browser policy, **not authentication**.
+
+### Set up ngrok on Windows
+
+Install the ngrok agent from the
+[official Windows download page](https://ngrok.com/downloads/windows), create
+an ngrok account, and copy your auth token from its dashboard. In PowerShell,
+save the token to ngrok's local user configuration:
+
+```powershell
+ngrok config add-authtoken YOUR_NGROK_AUTHTOKEN
+```
+
+Keep the auth token private; do not commit it or put it in Vercel. Start the
+backend as described below, then open a second PowerShell window and run:
+
+```powershell
+ngrok http 8000
+```
+
+Use the HTTPS forwarding address ngrok prints as the API base in Vercel, with
+`/api` appended. Free ngrok URLs can change when restarted; update
+`VITE_API_BASE_URL` in Vercel and `FRONTEND_ORIGINS` in the laptop `.env` to
+match, then redeploy the frontend and restart the backend.
+
+### Start and stop FastAPI
+
+From `Basic_RAG` in PowerShell, after configuring the `.env`:
+
+```powershell
+.\scripts\Start-RagServices.ps1
+```
+
+This starts FastAPI bound to `127.0.0.1:8000` and checks `/api/health`. Keep
+ngrok running in its separate PowerShell window. Logs and process IDs are
+written to the Git-ignored `.run/` folder.
+
+Stop only the processes started by the launcher with:
+
+```powershell
+.\scripts\Stop-RagServices.ps1
+```
+
+Run the start command again after a Windows reboot. Startup checks the PDF
+index version and reuses existing vectors when the same PDF and indexing
+configuration are already indexed; it does not clear or reset ChromaDB. Avoid
+the **Re-index PDF** action unless you intend to index the source again.
+
+### Deploy the frontend to Vercel
+
+1. Import `RAM56100M/RAG-Retrieval-Augmented-Generation` into Vercel.
+2. Set **Root Directory** to `frontend` (the Git repository root is
+   `Basic_RAG/`).
+3. Use the Vite framework preset, install command `npm install`, build command
+   `npm run build`, and output directory `dist`.
+4. Add the production environment variable
+   `VITE_API_BASE_URL=https://YOUR-NGROK-HOST/api`, replacing the example with
+   the HTTPS forwarding hostname shown by ngrok.
+5. Deploy. Copy the exact Vercel production origin, such as
+   `https://your-project.vercel.app`, into `FRONTEND_ORIGINS` in the laptop's
+   `.env`, then restart the backend.
+
+`VITE_API_BASE_URL` is public browser configuration; it must contain only the
+API URL, never a password or API key. The frontend has no client-side routes, so
+no custom Vercel rewrite or serverless API function is required. Vite's local
+development proxy remains available when the variable is unset. Redeploying
+the static frontend does not deploy or modify the laptop's backend, source PDF,
+keyring credentials, or ChromaDB index.
+
+Vercel preview deployments use different origins. They are blocked by CORS
+unless their exact HTTPS origins are added to `FRONTEND_ORIGINS` and the backend
+is restarted. Prefer testing with the production domain; do not allow broad
+Vercel wildcard origins.
+
+### Troubleshooting and security boundaries
+
+- **Backend unavailable / tunnel disconnected:** keep the laptop awake; check
+  `http://127.0.0.1:8000/api/health`, then inspect `.run\backend-error.log` or
+  the ngrok terminal.
+- **Browser CORS error:** verify that `FRONTEND_ORIGINS` exactly matches the
+  deployed scheme and hostname, and restart FastAPI after editing `.env`.
+- **401 / sign-in expired:** enter the backend access password again. Sessions
+  expire after the configured TTL and are invalidated when FastAPI restarts.
+- **Vercel 404 or API URL errors:** confirm the frontend root directory and
+  `VITE_API_BASE_URL` includes the `/api` suffix, then redeploy.
+- **No results:** confirm the local backend reports ready and the source index
+  exists; errors are not fixed by rebuilding the frontend.
+
+The browser-to-backend session is a single shared-password, single-user access
+gate, not per-user authorization. Anyone who learns the password can query the
+local PDF/Jira/Confluence index and use the configured Groq quota. Rate limits
+are in-memory best-effort protection, not a distributed abuse-prevention
+system. Do not publish the password, enable untrusted preview origins, or use
+this as a multi-user/production service. Cloudflare Tunnel avoids direct router
+port forwarding, but the backend is still internet-reachable through its
+authenticated tunnel hostname.
 
 ## Current limitations
 

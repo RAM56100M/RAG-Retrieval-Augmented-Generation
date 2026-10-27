@@ -8,3 +8,6 @@ frontend/dist/
 frontend/.vite/
 frontend/*.tsbuildinfo
 artifacts/
+.run/
+frontend/.env*
+!frontend/.env.example

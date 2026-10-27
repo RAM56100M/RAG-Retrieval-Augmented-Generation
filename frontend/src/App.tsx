@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { type FormEvent, useCallback, useEffect, useRef, useState } from "react";
 import {
   ArrowRight,
   ArrowUp,
@@ -116,7 +116,25 @@ type QueryResult = {
   diagnostics: QueryDiagnostics;
 };
 
-const API = "/api";
+type BackendHealth = {
+  status: "ok";
+  authentication_required: boolean;
+};
+
+type AccessTokenResponse = {
+  access_token: string;
+  token_type: "bearer";
+  expires_at: number;
+};
+
+class ApiRequestError extends Error {
+  constructor(message: string, readonly status: number) {
+    super(message);
+    this.name = "ApiRequestError";
+  }
+}
+
+const API_BASE_URL = (import.meta.env.VITE_API_BASE_URL || "/api").replace(/\/+$/, "");
 const suggestions = [
   "What is the main goal of this product?",
   "Which features are required for the shopping cart?",
@@ -132,21 +150,47 @@ const stages = [
   { id: "answering", name: "Answer", detail: "Groq LLM" },
 ];
 
-async function request<T>(path: string, init?: RequestInit): Promise<T> {
-  const response = await fetch(`${API}${path}`, {
-    ...init,
-    headers: { "Content-Type": "application/json", ...init?.headers },
-  });
+async function request<T>(
+  path: string,
+  init?: RequestInit,
+  accessToken?: string,
+): Promise<T> {
+  const controller = new AbortController();
+  const timeoutId = window.setTimeout(() => controller.abort(), 120_000);
+  let response: Response;
+  try {
+    response = await fetch(`${API_BASE_URL}${path}`, {
+      ...init,
+      signal: init?.signal ?? controller.signal,
+      headers: {
+        "Content-Type": "application/json",
+        ...(accessToken ? { Authorization: `Bearer ${accessToken}` } : {}),
+        ...init?.headers,
+      },
+    });
+  } catch (reason) {
+    if (reason instanceof DOMException && reason.name === "AbortError") {
+      throw new Error("The request timed out. Check that the backend and tunnel are running, then try again.");
+    }
+    throw new Error(
+      `Could not reach the RAG backend at ${API_BASE_URL}. Check that your laptop and tunnel are online.`,
+    );
+  } finally {
+    window.clearTimeout(timeoutId);
+  }
   if (!response.headers.get("content-type")?.includes("application/json")) {
-    throw new Error("The RAG API returned an unexpected response. Check that the backend is running.");
+    throw new Error("The RAG API returned an unexpected response. Check the backend and tunnel configuration.");
   }
   if (!response.ok) {
     const body = await response.json().catch(() => null);
-    throw new Error(
+    throw new ApiRequestError(
       body?.detail ??
-        (response.status >= 500
-          ? "The RAG API could not be reached. Start the backend with `uvicorn backend.main:app --reload`."
-          : `Request failed (${response.status})`),
+        (response.status === 401
+          ? "Your backend session expired. Sign in again."
+          : response.status === 429
+            ? "Too many requests. Wait briefly, then try again."
+            : `The RAG API returned an error (${response.status}).`),
+      response.status,
     );
   }
   return response.json() as Promise<T>;
@@ -174,6 +218,12 @@ function isQueryResult(value: unknown): value is QueryResult {
 
 function App() {
   const [status, setStatus] = useState<PipelineStatus | null>(null);
+  const [backendReachable, setBackendReachable] = useState(false);
+  const [authenticationRequired, setAuthenticationRequired] = useState<boolean | null>(null);
+  const [accessToken, setAccessToken] = useState("");
+  const [accessPassword, setAccessPassword] = useState("");
+  const [authenticating, setAuthenticating] = useState(false);
+  const [checkingBackend, setCheckingBackend] = useState(false);
   const [question, setQuestion] = useState("");
   const [retrievalMode, setRetrievalMode] = useState<RetrievalMode | "">("");
   const [sourceFilter, setSourceFilter] = useState<"all" | "pdf" | "jira" | "confluence">("all");
@@ -194,17 +244,92 @@ function App() {
 
   const refreshStatus = useCallback(async () => {
     try {
-      setStatus(await request<PipelineStatus>("/status"));
+      setStatus(await request<PipelineStatus>("/status", undefined, accessToken));
+      setBackendReachable(true);
     } catch (reason) {
+      setBackendReachable(false);
+      if (reason instanceof ApiRequestError && reason.status === 401) {
+        setAccessToken("");
+      }
       setError(reason instanceof Error ? reason.message : "Could not connect to the API.");
     }
-  }, []);
+  }, [accessToken]);
 
   useEffect(() => {
-    void refreshStatus();
-    const timer = window.setInterval(() => void refreshStatus(), 2000);
-    return () => window.clearInterval(timer);
-  }, [refreshStatus]);
+    let active = true;
+    const check = async () => {
+      try {
+        const health = await request<BackendHealth>("/health");
+        if (!active) return;
+        setBackendReachable(true);
+        setAuthenticationRequired(health.authentication_required);
+        if (!health.authentication_required || accessToken) {
+          await refreshStatus();
+        }
+      } catch (reason) {
+        if (!active) return;
+        setBackendReachable(false);
+        setError(reason instanceof Error ? reason.message : "Could not connect to the API.");
+      }
+    };
+    void check();
+    const timer = window.setInterval(() => void check(), 5000);
+    return () => {
+      active = false;
+      window.clearInterval(timer);
+    };
+  }, [accessToken, refreshStatus]);
+
+  const signIn = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    if (authenticating || !accessPassword) return;
+    setAuthenticating(true);
+    setError("");
+    try {
+      const session = await request<AccessTokenResponse>("/auth/token", {
+        method: "POST",
+        body: JSON.stringify({ password: accessPassword }),
+      });
+      setAccessToken(session.access_token);
+      setAccessPassword("");
+      setError("");
+      setStatus(await request<PipelineStatus>("/status", undefined, session.access_token));
+      setBackendReachable(true);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "Backend sign-in failed.");
+    } finally {
+      setAuthenticating(false);
+    }
+  };
+
+  const retryBackend = async () => {
+    setCheckingBackend(true);
+    setError("");
+    try {
+      const health = await request<BackendHealth>("/health");
+      setAuthenticationRequired(health.authentication_required);
+      setBackendReachable(true);
+      if (!health.authentication_required || accessToken) {
+        await refreshStatus();
+      }
+    } catch (reason) {
+      setBackendReachable(false);
+      setError(reason instanceof Error ? reason.message : "Could not connect to the API.");
+    } finally {
+      setCheckingBackend(false);
+    }
+  };
+
+  const signOut = async () => {
+    try {
+      await request<{ revoked: boolean }>("/auth/revoke", { method: "POST" }, accessToken);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "Could not revoke the backend session.");
+    }
+    setAccessToken("");
+    setStatus(null);
+    setResult(null);
+  };
 
   const submitQuestion = async (value = question) => {
     const normalized = value.trim();
@@ -224,7 +349,7 @@ function App() {
           issue_type: sourceFilter === "pdf" || sourceFilter === "confluence" ? undefined : issueTypeFilter.trim() || undefined,
           issue_status: sourceFilter === "pdf" || sourceFilter === "confluence" ? undefined : issueStatusFilter.trim() || undefined,
         }),
-      });
+      }, accessToken);
       if (!isQueryResult(answer)) {
         throw new Error(
           "The backend returned an outdated query response. Restart the backend to load the current API code, then try again.",
@@ -246,7 +371,7 @@ function App() {
     setIngesting(true);
     setError("");
     try {
-      setStatus(await request<PipelineStatus>("/ingest", { method: "POST" }));
+      setStatus(await request<PipelineStatus>("/ingest", { method: "POST" }, accessToken));
       setResult(null);
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : "Document ingestion failed.");
@@ -268,7 +393,7 @@ function App() {
           email: jiraEmail.trim(),
           api_token: jiraApiToken,
         }),
-      });
+      }, accessToken);
       setStatus((current) => current ? { ...current, jira: jiraStatus } : current);
       setJiraApiToken("");
       void refreshStatus();
@@ -288,7 +413,7 @@ function App() {
     try {
       const jiraStatus = await request<JiraStatus>("/jira/disconnect", {
         method: "POST",
-      });
+      }, accessToken);
       setStatus((current) => current ? { ...current, jira: jiraStatus } : current);
       await refreshStatus();
     } catch (reason) {
@@ -304,7 +429,7 @@ function App() {
     setSyncingAtlassian(true);
     setError("");
     try {
-      const jiraStatus = await request<JiraStatus>("/jira/sync", { method: "POST" });
+      const jiraStatus = await request<JiraStatus>("/jira/sync", { method: "POST" }, accessToken);
       setStatus((current) => current ? { ...current, jira: jiraStatus } : current);
       void refreshStatus();
     } catch (reason) {
@@ -326,6 +451,61 @@ function App() {
     ingesting ||
     (!!status && ["starting", "reading", "chunking", "embedding", "storing"].includes(status.stage));
 
+  if (!backendReachable) {
+    return (
+      <main className="access-screen">
+        <section className="access-card">
+          <div className="access-mark"><Network size={20} /></div>
+          <span className="section-label">LOCAL BACKEND</span>
+          <h1>Backend unavailable</h1>
+          <p>
+            The RAG backend could not be reached. Check that your laptop is
+            awake, FastAPI is running, and the Cloudflare Tunnel is connected.
+          </p>
+          {error && <div className="error-banner" role="alert">{error}</div>}
+          <button className="outline-button access-submit" onClick={() => void retryBackend()} disabled={checkingBackend}>
+            {checkingBackend ? <LoaderCircle className="spin" size={15} /> : <RotateCw size={15} />}
+            {checkingBackend ? "Checking…" : "Try again"}
+          </button>
+        </section>
+      </main>
+    );
+  }
+
+  if (authenticationRequired && !accessToken) {
+    return (
+      <main className="access-screen">
+        <section className="access-card">
+          <div className="access-mark"><LockKeyhole size={20} /></div>
+          <span className="section-label">PRIVATE BACKEND SESSION</span>
+          <h1>Sign in to RAG Explorer</h1>
+          <p>
+            Enter the access password configured on the laptop running the
+            backend. The session token stays in this tab and expires
+            automatically.
+          </p>
+          <form className="access-form" onSubmit={(event) => void signIn(event)}>
+            <label htmlFor="backend-access-password">Backend access password</label>
+            <input
+              id="backend-access-password"
+              type="password"
+              autoComplete="current-password"
+              value={accessPassword}
+              onChange={(event) => setAccessPassword(event.target.value)}
+              required
+              maxLength={1024}
+            />
+            {error && <div className="error-banner" role="alert">{error}</div>}
+            <button className="outline-button access-submit" type="submit" disabled={authenticating}>
+              {authenticating && <LoaderCircle className="spin" size={15} />}
+              {authenticating ? "Signing in…" : "Sign in"}
+            </button>
+          </form>
+        </section>
+      </main>
+    );
+  }
+
   return (
     <div className="app-shell">
       <div className="main-panel">
@@ -339,6 +519,9 @@ function App() {
               <span className="model-status"><i className={isReady ? "is-online" : ""} />ChromaDB</span>
               <span className="model-status"><i className={isReady ? "is-online" : ""} />{status?.embedding_model.split("/").pop() ?? "Nomic embeddings"}</span>
               <span className="model-status"><i className="is-online" />{status?.generation_model ?? "Groq LLM"}</span>
+              {authenticationRequired && accessToken && (
+                <button className="session-logout" onClick={signOut}>Sign out</button>
+              )}
             </div>
             <p className="app-tagline">PDF <span>→</span> chunk <span>→</span> Nomic embed <span>→</span> ChromaDB <span>→</span> retrieve top {status?.result_limit ?? 4} <span>→</span> Groq answer</p>
           </header>

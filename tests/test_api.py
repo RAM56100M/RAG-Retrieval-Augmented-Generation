@@ -1,4 +1,5 @@
 import unittest
+import hashlib
 from types import SimpleNamespace
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -356,6 +357,76 @@ class ApiTests(unittest.TestCase):
         self.assertTrue(fake_collection.deleted)
         self.assertEqual(main.status["stage"], "error")
         self.assertNotIn(str(pdf_path), str(main.status["error"]))
+
+    def test_pdf_startup_reuses_current_index_without_loading_embedding_model(self) -> None:
+        page_text = "A product requirements document with enough text to index."
+        pdf_bytes = b"unchanged PDF"
+        content_hash = hashlib.sha256(pdf_bytes).hexdigest()
+        index_configuration = (
+            f"{content_hash}|{main.PARSER_VERSION}|{main.CHUNKER_VERSION}|"
+            f"{main.CHUNK_WORDS}|{main.CHUNK_OVERLAP}|{main.EMBEDDING_MODEL}"
+        )
+        index_version = hashlib.sha256(
+            index_configuration.encode("utf-8")
+        ).hexdigest()
+        chunks = main.split_pdf_pages([(1, page_text)])
+        identifiers = [
+            f"pdf-{index_version[:12]}-{index:04d}"
+            for index in range(1, len(chunks) + 1)
+        ]
+
+        class FakePage:
+            def get_text(self, _format: str) -> str:
+                return page_text
+
+        class FakeDocument:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def __len__(self) -> int:
+                return 1
+
+            def __iter__(self):
+                return iter([FakePage()])
+
+        class ExistingCollection:
+            def get(self, *, where, include):
+                if where == {"source_type": "pdf"}:
+                    return {
+                        "ids": identifiers,
+                        "metadatas": [
+                            {
+                                "document_hash": content_hash,
+                                "index_version": index_version,
+                            }
+                            for _ in identifiers
+                        ],
+                    }
+                return {"ids": []}
+
+            def upsert(self, **_kwargs) -> None:
+                raise AssertionError("Current PDF records should be reused")
+
+            def delete(self, *, ids) -> None:
+                raise AssertionError("Current PDF records should not be deleted")
+
+        with TemporaryDirectory() as temp_dir:
+            pdf_path = Path(temp_dir) / "requirements.pdf"
+            pdf_path.write_bytes(pdf_bytes)
+            with (
+                patch.object(main, "find_pdf", return_value=pdf_path),
+                patch.object(main.pymupdf, "open", return_value=FakeDocument()),
+                patch.object(main, "get_collection", return_value=ExistingCollection()),
+                patch.object(main, "get_model", side_effect=AssertionError("Unnecessary re-embedding")),
+            ):
+                main.ingest_document()
+
+        self.assertEqual(main.status["stage"], "ready")
+        self.assertIn("reusing existing vectors", main.status["message"])
+        self.assertEqual(main.status["index_version"], index_version)
 
     def test_jira_index_preserves_labels_status_and_issue_relationships(self) -> None:
         class CapturingCollection:

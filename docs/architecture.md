@@ -67,6 +67,31 @@ names, and retrieval/generation/total timings. The frontend displays those
 observable diagnostics and the actual retrieved excerpts, with links to Jira
 issues and Confluence pages. It does not display hidden model reasoning.
 
+## Remote frontend boundary
+
+The Vite frontend reads its backend base URL from `VITE_API_BASE_URL`; its
+development proxy is only a local convenience. For Vercel, host the static
+build independently and route browser requests through a Cloudflare Tunnel to
+FastAPI on the laptop. FastAPI remains bound to loopback, and ChromaDB, PDF
+files, embedding model, and Atlassian keyring credentials remain local.
+
+`FRONTEND_ORIGINS` is parsed as a comma-separated list of exact HTTPS origins
+(plus the two loopback development origins). Wildcards, paths, credentials,
+and non-HTTPS remote origins are rejected. The backend does not enable CORS
+credentials. When `RAG_ACCESS_PASSWORD` is configured, a public health route
+is the only unauthenticated API endpoint other than token issue; other API
+routes require an in-memory, short-lived bearer session. Login/query/mutation
+requests are rate-limited and declared API bodies over 1 MB are rejected.
+These controls provide a simple single-user gate, not multi-user identity,
+per-project authorization, or distributed abuse protection.
+
+The frontend prompts for the access password and retains the issued session
+token in memory only. Neither the password nor token is a Vercel environment
+variable or embedded in the build. Vercel previews require their exact origins
+to be explicitly added to backend CORS configuration. CORS does not protect
+the API from direct non-browser clients; bearer authentication is required
+for remote use.
+
 ## Evaluation
 
 `backend.evaluate` embeds the configured PDF into an in-memory ephemeral

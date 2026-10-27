@@ -14,8 +14,9 @@ from urllib.parse import urlsplit
 import chromadb
 import pymupdf
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from groq import Groq
 from pydantic import BaseModel, Field, field_validator
 from sentence_transformers import SentenceTransformer
@@ -27,6 +28,12 @@ from backend.atlassian import (
 )
 from backend.citations import resolve_citations
 from backend.retrieval import keyword_search, reciprocal_rank_fusion, source_id_from_metadata
+from backend.security import (
+    AccessTokenManager,
+    InMemoryRateLimiter,
+    configured_frontend_origins,
+    validate_access_password,
+)
 
 LOGGER = logging.getLogger(__name__)
 ROOT = Path(__file__).resolve().parent.parent
@@ -62,6 +69,26 @@ if min(RETRIEVAL_CANDIDATES, RRF_RANK_CONSTANT, RESULT_LIMIT) <= 0:
     raise ValueError(
         "RETRIEVAL_CANDIDATES, RRF_RANK_CONSTANT, and RESULT_LIMIT must be positive."
     )
+FRONTEND_ORIGINS = configured_frontend_origins(os.getenv("FRONTEND_ORIGINS"))
+ACCESS_PASSWORD = os.getenv("RAG_ACCESS_PASSWORD", "")
+AUTHENTICATION_ENABLED = bool(ACCESS_PASSWORD)
+validate_access_password(ACCESS_PASSWORD)
+if any(
+    origin not in {"http://localhost:5173", "http://127.0.0.1:5173"}
+    for origin in FRONTEND_ORIGINS
+) and not AUTHENTICATION_ENABLED:
+    raise ValueError(
+        "Set a RAG_ACCESS_PASSWORD of at least 16 characters before allowing a remote frontend origin."
+    )
+try:
+    ACCESS_TOKEN_TTL_SECONDS = int(os.getenv("RAG_ACCESS_TOKEN_TTL_SECONDS", "3600"))
+except ValueError as exc:
+    raise ValueError("RAG_ACCESS_TOKEN_TTL_SECONDS must be an integer.") from exc
+if not 300 <= ACCESS_TOKEN_TTL_SECONDS <= 86400:
+    raise ValueError("RAG_ACCESS_TOKEN_TTL_SECONDS must be between 300 and 86400.")
+ACCESS_TOKENS = AccessTokenManager(ACCESS_TOKEN_TTL_SECONDS)
+RATE_LIMITER = InMemoryRateLimiter()
+MAX_API_REQUEST_BYTES = 1_048_576
 
 status: dict[str, Any] = {
     "stage": "starting",
@@ -239,6 +266,35 @@ def ingest_document() -> None:
                 index_version=index_version,
             )
 
+            target = get_collection()
+            existing_pdf = target.get(
+                where={"source_type": "pdf"},
+                include=["metadatas"],
+            )
+            existing_pdf_ids = existing_pdf["ids"]
+            existing_pdf_metadatas = existing_pdf.get("metadatas") or []
+            existing_index_is_current = (
+                set(existing_pdf_ids) == set(chunk_ids)
+                and len(existing_pdf_metadatas) == len(chunk_ids)
+                and all(
+                    metadata
+                    and metadata.get("document_hash") == content_hash
+                    and metadata.get("index_version") == index_version
+                    for metadata in existing_pdf_metadatas
+                )
+            )
+            if existing_index_is_current:
+                set_status(
+                    "ready",
+                    "The local PDF index is already current; reusing existing vectors.",
+                    file_name=source.name,
+                    page_count=page_count,
+                    chunk_count=len(chunks),
+                    index_version=index_version,
+                    error=None,
+                )
+                return
+
             set_status("embedding", f"Generating vectors with {EMBEDDING_MODEL}")
             with embedding_lock:
                 vectors = get_model().encode(
@@ -248,8 +304,6 @@ def ingest_document() -> None:
                 ).tolist()
 
             set_status("storing", "Saving vectors to the local ChromaDB collection")
-            target = get_collection()
-            existing_pdf_ids = target.get(where={"source_type": "pdf"}, include=[])["ids"]
             legacy_pdf_ids = target.get(where={"source": source.name}, include=[])["ids"]
             previous_ids = set(existing_pdf_ids + legacy_pdf_ids)
             current_ids = set(chunk_ids)
@@ -955,12 +1009,130 @@ async def lifespan(_: FastAPI):
 
 
 app = FastAPI(title="RAG Explorer API", lifespan=lifespan)
+
+
+@app.middleware("http")
+async def protect_api(request: Request, call_next):
+    if not request.url.path.startswith("/api/"):
+        return await call_next(request)
+    if request.method == "OPTIONS":
+        return await call_next(request)
+
+    content_length = request.headers.get("content-length")
+    if content_length:
+        try:
+            if int(content_length) > MAX_API_REQUEST_BYTES:
+                return JSONResponse(
+                    status_code=413,
+                    content={"detail": "Request body exceeds the 1 MB limit."},
+                )
+        except ValueError:
+            return JSONResponse(
+                status_code=400,
+                content={"detail": "Invalid Content-Length header."},
+            )
+
+    client_host = request.client.host if request.client else "unknown"
+    path = request.url.path
+    if path == "/api/auth/token":
+        limit, window, bucket = 5, 900, "authentication"
+    elif path == "/api/query":
+        limit, window, bucket = 20, 60, "query"
+    elif request.method not in {"GET", "HEAD"}:
+        limit, window, bucket = 10, 60, "mutations"
+    else:
+        limit, window, bucket = 180, 60, "read"
+    allowed, retry_after = RATE_LIMITER.allow(
+        client_host,
+        bucket,
+        limit=limit,
+        window_seconds=window,
+    )
+    if not allowed:
+        return JSONResponse(
+            status_code=429,
+            content={"detail": "Too many requests. Try again shortly."},
+            headers={"Retry-After": str(retry_after)},
+        )
+
+    if path not in {"/api/health", "/api/auth/token"} and AUTHENTICATION_ENABLED:
+        authorization = request.headers.get("authorization", "")
+        scheme, separator, token = authorization.partition(" ")
+        if (
+            not separator
+            or scheme.lower() != "bearer"
+            or not ACCESS_TOKENS.validate(token.strip())
+        ):
+            return JSONResponse(
+                status_code=401,
+                content={"detail": "Authentication required. Sign in to the local RAG backend."},
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+
+    body_parts: list[bytes] = []
+    body_size = 0
+    async for body_part in request.stream():
+        body_size += len(body_part)
+        if body_size > MAX_API_REQUEST_BYTES:
+            return JSONResponse(
+                status_code=413,
+                content={"detail": "Request body exceeds the 1 MB limit."},
+            )
+        body_parts.append(body_part)
+    body = b"".join(body_parts)
+    request._body = body
+    return await call_next(request)
+
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=FRONTEND_ORIGINS,
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type"],
+    allow_credentials=False,
+    max_age=600,
 )
+
+
+class AccessTokenRequest(BaseModel):
+    password: str = Field(min_length=1, max_length=1024)
+
+
+@app.get("/api/health")
+def health() -> dict[str, Any]:
+    return {
+        "status": "ok",
+        "authentication_required": AUTHENTICATION_ENABLED,
+    }
+
+
+@app.post("/api/auth/token")
+def issue_access_token(request: AccessTokenRequest) -> dict[str, Any]:
+    if not AUTHENTICATION_ENABLED:
+        raise HTTPException(
+            status_code=409,
+            detail="Backend authentication is not configured.",
+        )
+    try:
+        token, expires_at = ACCESS_TOKENS.issue(
+            request.password,
+            ACCESS_PASSWORD,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=401, detail=str(exc)) from exc
+    return {
+        "access_token": token,
+        "token_type": "bearer",
+        "expires_at": expires_at,
+    }
+
+
+@app.post("/api/auth/revoke")
+def revoke_access_token(request: Request) -> dict[str, bool]:
+    authorization = request.headers.get("authorization", "")
+    _, _, token = authorization.partition(" ")
+    revoked = ACCESS_TOKENS.revoke(token.strip())
+    return {"revoked": revoked}
 
 
 class QueryRequest(BaseModel):
